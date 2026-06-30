@@ -118,10 +118,10 @@ This halves the battery voltage (4.2V → 2.1V) so it stays safely under the Pic
 
 ---
 
-## Open Items / Decisions Needed
+## Open Items / Decisions Needed (resolved)
 
 1. **Matrix brightness** — defaults to ~30% software brightness (level 3/15), adjustable via webUI/MQTT/encoder.
-2. **Enclosure split** — case will likely be two parts: front panel (2x4 matrix grid, screw/clip mounted) and rear enclosure (Pico, battery, OLED, encoder, buttons, buzzer). Confirmed: wiring through a back panel cutout, no custom PCB.
+2. **Enclosure** — built as two printed parts: a single fused front housing (side walls + front face with all 8 module windows/standoffs printed as one continuous shell, no seam) and a removable back panel (OLED, encoder, buttons, buzzer, USB-C, power switch). See `../case/` for STLs and source.
 
-Both confirmed — moving to 3D case design next.
+All open items resolved — see `../case/` and `../firmware/` for the finished design.
 

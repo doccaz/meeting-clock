@@ -43,5 +43,6 @@ Default topic prefix: `meetingmonitor` (change in `config.py`).
 ## Battery monitoring
 A voltage divider (2x 100kΩ) taps the raw LiPo+ terminal (before the boost converter) into GP26/ADC0 — see the wiring doc for the diagram. This keeps the reading independent of the regulated 5V rail.
 
-## Next steps
-- 3D printable case (front matrix panel + rear electronics bay) — in progress.
+## Related
+- `../case/` — 3D-printable case (fused front housing + removable back panel), STLs and OpenSCAD source.
+- `../wiring/` — full parts list and wiring diagram.
