@@ -1,13 +1,12 @@
 """
-main.py - entry point. Boots WiFi (STA, falling back to AP), starts the web
-server, MQTT client, OLED/encoder UI, and the matrix display loop.
+main.py - entry point.
 
-Run with cooperative asyncio tasks so timers, animations, MQTT, and the web
-server all stay responsive together.
+Auto-detects WiFi capability at boot by trying to import `network`.
+On a plain Pico (no wireless), WiFi / MQTT / web server are skipped
+entirely and the app runs fully offline. On a Pico W they boot normally.
 """
 import uasyncio as asyncio
 import time
-import json
 from machine import ADC, Pin
 
 import config
@@ -15,8 +14,17 @@ from display import Display, Zone
 from timers import Timer
 from buzzer import Buzzer
 from ui import UI
-import webserver
-import mqtt_handler
+
+# ---- WiFi capability auto-detect ----
+try:
+    import network as _net  # noqa: F401  (just testing import)
+    WIFI_CAPABLE = True
+except ImportError:
+    WIFI_CAPABLE = False
+
+if WIFI_CAPABLE:
+    import webserver
+    import mqtt_handler
 
 DEFAULT_MESSAGES = [
     "Meeting in progress",
@@ -29,37 +37,58 @@ DEFAULT_MESSAGES = [
 # the boost converter) into GP26 (ADC0), per the wiring doc — 100k/100k
 # halves 4.2V down to 2.1V, safely under the 3.3V ADC max.
 BATTERY_ADC_PIN = 26
-BATTERY_DIVIDER_RATIO = 2.0  # multiply ADC voltage by this to get true batt voltage
+BATTERY_DIVIDER_RATIO = 2.0
 BATTERY_MIN_V = 3.3
 BATTERY_MAX_V = 4.2
 
 
+class _NullWifi:
+    """Drop-in stub so App code never needs to branch on WIFI_CAPABLE."""
+    mode = "none"
+    def status_string(self): return "No WiFi"
+    def try_connect_sta(self, *a, **kw): return False
+    def start_ap(self): pass
+
+
+class _NullMqtt:
+    connected = False
+    def connect(self): pass
+    def poll(self): pass
+    def publish_status(self): pass
+
+
 class App:
     def __init__(self):
+        self.wifi_capable = WIFI_CAPABLE
         self.display = Display()
         self.buzzer = Buzzer(config.BUZZER_PIN)
-        self.wifi = webserver.WifiManager()
         self.timer = Timer("countdown")
         self.timer.on_done = self._on_timer_done
-        self.mode = None  # "countdown" | "stopwatch" | "message"
+        self.mode = None
         self.saved_messages = list(DEFAULT_MESSAGES)
         self.current_message = None
         self._pending_wifi_reconnect = False
         self._pending_mqtt_reconnect = False
 
-        settings = webserver.load_settings()
+        if WIFI_CAPABLE:
+            settings = webserver.load_settings()
+            self.wifi = webserver.WifiManager()
+            self.mqtt = mqtt_handler.MqttHandler(
+                self,
+                broker=settings.get("mqtt_broker", config.MQTT_BROKER),
+                port=settings.get("mqtt_port", config.MQTT_PORT),
+                client_id=config.MQTT_CLIENT_ID,
+                prefix=config.MQTT_TOPIC_PREFIX,
+                user=settings.get("mqtt_user", config.MQTT_USER),
+                password=settings.get("mqtt_pass", config.MQTT_PASS),
+            )
+        else:
+            settings = {}
+            self.wifi = _NullWifi()
+            self.mqtt = _NullMqtt()
+
         self.brightness_level = settings.get("brightness", config.DEFAULT_BRIGHTNESS)
         self.display.brightness(self.brightness_level)
-
-        self.mqtt = mqtt_handler.MqttHandler(
-            self,
-            broker=settings.get("mqtt_broker", config.MQTT_BROKER),
-            port=settings.get("mqtt_port", config.MQTT_PORT),
-            client_id=config.MQTT_CLIENT_ID,
-            prefix=config.MQTT_TOPIC_PREFIX,
-            user=settings.get("mqtt_user", config.MQTT_USER),
-            password=settings.get("mqtt_pass", config.MQTT_PASS),
-        )
 
         try:
             self.battery_adc = ADC(Pin(BATTERY_ADC_PIN))
@@ -70,13 +99,15 @@ class App:
 
     # ---- boot sequence ----
     def boot_network(self):
+        if not WIFI_CAPABLE:
+            return
         settings = webserver.load_settings()
         ssid = settings.get("wifi_ssid", config.WIFI_SSID)
         password = settings.get("wifi_pass", config.WIFI_PASS)
         if not self.wifi.try_connect_sta(ssid, password):
             self.wifi.start_ap()
 
-    # ---- timer actions (called from UI, web, or MQTT) ----
+    # ---- timer actions ----
     def start_countdown(self, seconds):
         self.mode = "countdown"
         self.timer = Timer("countdown")
@@ -122,20 +153,26 @@ class App:
     def set_brightness(self, level):
         self.brightness_level = level
         self.display.brightness(level)
-        s = webserver.load_settings()
-        s["brightness"] = level
-        webserver.save_settings(s)
+        if WIFI_CAPABLE:
+            s = webserver.load_settings()
+            s["brightness"] = level
+            webserver.save_settings(s)
 
     def toggle_ap_mode(self):
+        if not WIFI_CAPABLE:
+            return
         if self.wifi.mode == "ap":
             self._pending_wifi_reconnect = True
         else:
             self.wifi.start_ap()
 
     def reconnect_mqtt(self):
-        self._pending_mqtt_reconnect = True
+        if WIFI_CAPABLE:
+            self._pending_mqtt_reconnect = True
 
     def reset_wifi_settings(self):
+        if not WIFI_CAPABLE:
+            return
         s = webserver.load_settings()
         s["wifi_ssid"] = ""
         s["wifi_pass"] = ""
@@ -190,7 +227,8 @@ class App:
         return "OK" if self.mqtt.connected else "--"
 
     def active_mode_label(self):
-        return {"countdown": "Countdown", "stopwatch": "Stopwatch", "message": "Message"}.get(self.mode, "Idle")
+        return {"countdown": "Countdown", "stopwatch": "Stopwatch",
+                "message": "Message"}.get(self.mode, "Idle")
 
     def battery_percent(self):
         if not self.battery_adc:
@@ -201,6 +239,8 @@ class App:
         pct = (v_batt - BATTERY_MIN_V) / (BATTERY_MAX_V - BATTERY_MIN_V) * 100
         return max(0, min(100, round(pct)))
 
+
+# ---- async tasks ----
 
 async def task_display_tick(app):
     while True:
@@ -253,17 +293,23 @@ async def task_wifi_watchdog(app):
 async def main():
     app = App()
     app.boot_network()
-    await webserver.run_server(app, port=80)
-    app.mqtt.connect()
 
-    await asyncio.gather(
+    tasks = [
         task_display_tick(app),
         task_timer_tick(app),
         task_ui_poll(app),
-        task_mqtt_poll(app),
-        task_mqtt_status_publish(app),
-        task_wifi_watchdog(app),
-    )
+    ]
+
+    if WIFI_CAPABLE:
+        await webserver.run_server(app, port=80)
+        app.mqtt.connect()
+        tasks += [
+            task_mqtt_poll(app),
+            task_mqtt_status_publish(app),
+            task_wifi_watchdog(app),
+        ]
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

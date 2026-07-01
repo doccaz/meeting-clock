@@ -4,6 +4,9 @@ ui.py - encoder, buttons, and OLED menu state machine.
 Requires ssd1306.py on the device (standard MicroPython driver). Install with:
     import mip; mip.install("ssd1306")
 or copy ssd1306.py from micropython-lib into the project folder.
+
+WiFi-dependent settings items are shown greyed out (prefixed with a dash
+rather than selectable) when running on a plain Pico without wireless.
 """
 from machine import Pin, I2C
 import time
@@ -13,6 +16,14 @@ try:
     import ssd1306
 except ImportError:
     ssd1306 = None  # UI will run "headless" (no OLED) if driver missing
+
+# Wifi capability flag - mirrors the check in main.py, done independently
+# here so ui.py has no circular import dependency on main.
+try:
+    import network as _net  # noqa: F401
+    _WIFI_CAPABLE = True
+except ImportError:
+    _WIFI_CAPABLE = False
 
 
 class Encoder:
@@ -31,7 +42,6 @@ class Encoder:
 
     def _on_change(self, pin):
         state = (self.pa.value() << 1) | self.pb.value()
-        # standard quadrature transition table
         transitions = {
             (0b00, 0b01): 1, (0b01, 0b11): 1, (0b11, 0b10): 1, (0b10, 0b00): 1,
             (0b00, 0b10): -1, (0b10, 0b11): -1, (0b11, 0b01): -1, (0b01, 0b00): -1,
@@ -41,19 +51,17 @@ class Encoder:
         self._last_state = state
 
     def read_steps(self):
-        """Returns net detents moved since last call (each detent = 4 transitions)."""
         steps = self._pos // 4
         self._pos -= steps * 4
         return steps
 
     def pressed(self):
-        """Debounced single-press detect (call every loop iteration)."""
         now = time.ticks_ms()
         val = self.sw.value()
         if val != self._sw_last and time.ticks_diff(now, self._sw_last_change) > 30:
             self._sw_last_change = now
             self._sw_last = val
-            if val == 0:  # active-low, just pressed
+            if val == 0:
                 return True
         return False
 
@@ -66,11 +74,9 @@ class Button:
         self._press_start = 0
 
     def short_press(self):
-        """Returns True once per short press (release before 600ms)."""
         return self._poll() == "short"
 
     def long_press(self):
-        """Returns True once per long press (held >= 600ms)."""
         return self._poll() == "long"
 
     def _poll(self):
@@ -88,6 +94,16 @@ class Button:
         return result
 
 
+# Settings menu items: (label, wifi_required)
+_SETTINGS_ITEMS = [
+    ("Brightness",      False),
+    ("AP Mode",         True),
+    ("MQTT Reconnect",  True),
+    ("WiFi Reset",      True),
+    ("Back",            False),
+]
+
+
 class UI:
     SCREEN_HOME = "home"
     SCREEN_MODE_SELECT = "mode_select"
@@ -97,23 +113,32 @@ class UI:
     SCREEN_SETTINGS = "settings"
 
     MODES = ["Countdown", "Stopwatch", "Message", "Settings"]
-    SETTINGS_ITEMS = ["Brightness", "AP Mode", "MQTT Reconnect", "WiFi Reset", "Back"]
 
     def __init__(self, app):
-        self.app = app  # reference to main App for shared state/actions
+        self.app = app
         self.encoder = Encoder(config.ENC_A, config.ENC_B, config.ENC_SW)
         self.btn_a = Button(config.BTN_A)
         self.btn_b = Button(config.BTN_B)
 
         self.oled = None
         if ssd1306:
-            i2c = I2C(config.OLED_I2C_ID, sda=Pin(config.OLED_SDA), scl=Pin(config.OLED_SCL), freq=400_000)
-            self.oled = ssd1306.SSD1306_I2C(config.OLED_WIDTH, config.OLED_HEIGHT, i2c, addr=config.OLED_ADDR)
+            i2c = I2C(config.OLED_I2C_ID, sda=Pin(config.OLED_SDA),
+                      scl=Pin(config.OLED_SCL), freq=400_000)
+            self.oled = ssd1306.SSD1306_I2C(config.OLED_WIDTH, config.OLED_HEIGHT,
+                                             i2c, addr=config.OLED_ADDR)
 
         self.screen = self.SCREEN_HOME
         self.menu_index = 0
         self.countdown_minutes = 5
         self._dirty = True
+
+    def _settings_items(self):
+        """Returns list of (label, enabled) for the settings screen."""
+        return [(label, not wifi_req or _WIFI_CAPABLE)
+                for label, wifi_req in _SETTINGS_ITEMS]
+
+    def _settings_labels(self):
+        return [label for label, _ in _SETTINGS_ITEMS]
 
     # ---- input handling ----
     def update(self):
@@ -134,6 +159,8 @@ class UI:
             self._dirty = False
 
     def _handle_input(self, steps, enc_press, a_short, a_long, b_short, b_long):
+        items = self._settings_items()
+
         if self.screen == self.SCREEN_HOME:
             if enc_press or b_short:
                 self.screen = self.SCREEN_MODE_SELECT
@@ -186,20 +213,22 @@ class UI:
                 self.screen = self.SCREEN_HOME
 
         elif self.screen == self.SCREEN_SETTINGS:
-            self.menu_index = (self.menu_index + steps) % len(self.SETTINGS_ITEMS)
+            self.menu_index = (self.menu_index + steps) % len(items)
             if b_short:
                 self.screen = self.SCREEN_MODE_SELECT
             elif enc_press:
-                item = self.SETTINGS_ITEMS[self.menu_index]
-                if item == "Brightness":
+                label, enabled = items[self.menu_index]
+                if not enabled:
+                    return  # greyed-out: ignore press silently
+                if label == "Brightness":
                     self.app.cycle_brightness()
-                elif item == "AP Mode":
+                elif label == "AP Mode":
                     self.app.toggle_ap_mode()
-                elif item == "MQTT Reconnect":
+                elif label == "MQTT Reconnect":
                     self.app.reconnect_mqtt()
-                elif item == "WiFi Reset":
+                elif label == "WiFi Reset":
                     self.app.reset_wifi_settings()
-                elif item == "Back":
+                elif label == "Back":
                     self.screen = self.SCREEN_MODE_SELECT
 
     # ---- rendering ----
@@ -208,34 +237,50 @@ class UI:
             return
         o = self.oled
         o.fill(0)
+
         if self.screen == self.SCREEN_HOME:
             o.text(self.app.clock_string(), 0, 0)
-            o.text("WiFi: " + self.app.wifi_status_string(), 0, 16)
-            o.text("MQTT: " + self.app.mqtt_status_string(), 0, 28)
-            o.text("Batt: {}%".format(self.app.battery_percent()), 0, 40)
+            if _WIFI_CAPABLE:
+                o.text("WiFi: " + self.app.wifi_status_string(), 0, 16)
+                o.text("MQTT: " + self.app.mqtt_status_string(), 0, 28)
+                o.text("Batt: {}%".format(self.app.battery_percent()), 0, 40)
+            else:
+                o.text("No WiFi (Pico)", 0, 16)
+                o.text("Batt: {}%".format(self.app.battery_percent()), 0, 28)
             o.text("Press to menu", 0, 54)
+
         elif self.screen == self.SCREEN_MODE_SELECT:
             o.text("-- Mode --", 0, 0)
             for i, m in enumerate(self.MODES):
                 prefix = ">" if i == self.menu_index else " "
                 o.text("{}{}".format(prefix, m), 0, 16 + i * 12)
+
         elif self.screen == self.SCREEN_COUNTDOWN_SET:
             o.text("Set countdown", 0, 0)
             o.text("{} min".format(self.countdown_minutes), 30, 24)
             o.text("Rotate=adjust", 0, 48)
             o.text("Press=start", 0, 56)
+
         elif self.screen == self.SCREEN_RUNNING:
             o.text(self.app.active_mode_label(), 0, 0)
             o.text(self.app.timer.display_string(), 20, 24)
             o.text(self.app.timer.state, 0, 48)
+
         elif self.screen == self.SCREEN_MESSAGE_SELECT:
             o.text("-- Messages --", 0, 0)
             for i, m in enumerate(self.app.saved_messages[:4]):
                 prefix = ">" if i == self.menu_index else " "
                 o.text("{}{}".format(prefix, m[:14]), 0, 16 + i * 12)
+
         elif self.screen == self.SCREEN_SETTINGS:
             o.text("-- Settings --", 0, 0)
-            for i, s in enumerate(self.SETTINGS_ITEMS):
-                prefix = ">" if i == self.menu_index else " "
-                o.text("{}{}".format(prefix, s), 0, 16 + i * 9)
+            for i, (label, enabled) in enumerate(self._settings_items()):
+                if i == self.menu_index and enabled:
+                    prefix = ">"
+                elif not enabled:
+                    prefix = "-"  # greyed out
+                else:
+                    prefix = " "
+                o.text("{}{}".format(prefix, label), 0, 16 + i * 9)
+
         o.show()
